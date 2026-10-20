@@ -2,6 +2,8 @@
 
 End-to-end steps for enrolling ChromeOS devices, querying the Chrome Management Telemetry API, and surfacing device health and events in New Relic.
 
+![chromeos-monitoring-architecture](https://github.com/amoradi-nr/chromeos-monitoring/blob/main/chromeos_architecture.png?raw=true)
+
 ---
 
 ## Table of Contents
