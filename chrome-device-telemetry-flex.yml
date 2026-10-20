@@ -1,0 +1,75 @@
+# New Relic Flex Integration — Chrome Device Telemetry
+#
+# DEPLOY:
+#   Copy this file to: /etc/newrelic-infra/integrations.d/chrome-device-telemetry-flex.yml
+#   Copy chrome_flex.sh to a stable path (e.g. /opt/chrome-telemetry/chrome_flex.sh)
+#   Ensure chrome_flex.sh is executable: chmod +x /opt/chrome-telemetry/chrome_flex.sh
+#
+# CONFIGURE:
+#   Set POLL_INTERVAL below (how often to run — match EVENTS_LOOKBACK to overlap slightly)
+#   Set SCRIPT_PATH to wherever chrome_flex.sh is deployed
+#   Set CHROME_CUSTOMER_ID and CHROME_KEY_FILE if not using the defaults baked into chrome_flex.sh
+#
+# LICENSE KEY:
+#   Add your New Relic license key to /etc/newrelic-infra.yml:
+#     license_key: YOUR_LICENSE_KEY_HERE
+#
+# QUERY IN NEW RELIC:
+#   FROM ChromeDeviceHealthSample SELECT * SINCE 1 hour ago
+#   FROM ChromeTelemetryEventSample SELECT * SINCE 1 hour ago
+
+integrations:
+  - name: nri-flex
+
+    # ---------------------------------------------------------------------------
+    # POLL INTERVAL — how often the integration runs
+    # Recommended values: 300s (5 min), 600s (10 min), 900s (15 min), 3600s (1 hour)
+    # ---------------------------------------------------------------------------
+    interval: 300s
+
+    # Allow enough time for token fetch + multiple API calls
+    timeout: 90s
+
+    config:
+      name: ChromeDeviceTelemetry
+
+      # Added to every event from this integration
+      custom_attributes:
+        integration: chrome-device-telemetry
+        customer: C044xpmyc
+
+      apis:
+        # -----------------------------------------------------------------------
+        # Device Health
+        # Queries: CPU, memory, storage, battery, network, OS update status
+        # Event type in NRDB: ChromeDeviceHealthSample
+        # One event per ChromeOS device per poll
+        # -----------------------------------------------------------------------
+        - event_type: ChromeDeviceHealthSample
+          timeout: 60000
+          commands:
+            - run: /opt/chrome-telemetry/chrome_flex.sh health
+              shell: /bin/bash
+              env:
+                CHROME_CUSTOMER_ID: C044xpmyc
+                CHROME_KEY_FILE: /opt/chrome-telemetry/chromedevicemanagement-491916-387cd746f5a6.json
+                CHROME_ADMIN_EMAIL: audiemoradi@audiemoradi.com
+
+        # -----------------------------------------------------------------------
+        # Telemetry Events
+        # Queries: network state changes, HTTPS latency, WiFi signal, OS crashes,
+        #          USB add/remove, app install/uninstall
+        # Event type in NRDB: ChromeTelemetryEventSample
+        # One event per telemetry event captured in the lookback window
+        #
+        # EVENTS_LOOKBACK should be slightly longer than the poll interval
+        # to avoid gaps (e.g. poll every 5m → look back 6m)
+        # -----------------------------------------------------------------------
+        - event_type: ChromeTelemetryEventSample
+          timeout: 60000
+          commands:
+            - run: /opt/chrome-telemetry/chrome_flex.sh events --since 6m
+              shell: /bin/bash
+              env:
+                CHROME_CUSTOMER_ID: C044xpmyc
+                CHROME_KEY_FILE: /opt/chrome-telemetry/chromedevicemanagement-491916-387cd746f5a6.json

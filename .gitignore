@@ -1,0 +1,22 @@
+# Service account key files — never commit credentials
+chromedevicemanagement-491916-387cd746f5a6.json
+*-sa-key.json
+*service-account*.json
+*-key.json
+
+# macOS
+.DS_Store
+
+# Claude Code project settings
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Troubleshooting / diagnostic scripts
+Troubleshooting/
