@@ -71,14 +71,17 @@ PYEOF
 get_token() {
   python3 - "$CHROME_KEY_FILE" <<'PYEOF'
 from google.oauth2 import service_account
-import google.auth.transport.requests, sys
+import google.auth.transport.requests, requests as _requests, sys, urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     creds = service_account.Credentials.from_service_account_file(
         sys.argv[1],
         scopes=['https://www.googleapis.com/auth/chrome.management.telemetry.readonly']
     )
-    creds.refresh(google.auth.transport.requests.Request())
+    session = _requests.Session()
+    session.verify = False
+    creds.refresh(google.auth.transport.requests.Request(session=session))
     print(creds.token)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
@@ -93,7 +96,8 @@ PYEOF
 get_directory_token() {
   python3 - "$CHROME_KEY_FILE" "$CHROME_ADMIN_EMAIL" <<'PYEOF'
 from google.oauth2 import service_account
-import google.auth.transport.requests, sys
+import google.auth.transport.requests, requests as _requests, sys, urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 key_file, subject = sys.argv[1], sys.argv[2]
 try:
@@ -101,7 +105,9 @@ try:
         key_file,
         scopes=['https://www.googleapis.com/auth/admin.directory.device.chromeos.readonly']
     ).with_subject(subject)
-    creds.refresh(google.auth.transport.requests.Request())
+    session = _requests.Session()
+    session.verify = False
+    creds.refresh(google.auth.transport.requests.Request(session=session))
     print(creds.token)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
@@ -154,7 +160,7 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Single API GET — writes response JSON to a temp file, returns its path
 # ---------------------------------------------------------------------------
-FLEX_LOG="${TMPDIR:-/tmp}/chrome_flex_errors.log"
+FLEX_LOG="${TMPDIR:-/tmp}/chrome_flex_errors_$(id -u).log"
 
 api_get() {
   local url="$1" tok="$2"
@@ -414,16 +420,17 @@ print(json.dumps(events))
 PYEOF
 
   rm -f "$resp_file"
-  [[ -n "$dir_file" ]] && rm -f "$dir_file"
+  if [[ -n "$dir_file" ]]; then rm -f "$dir_file"; fi
 }
 
 # ---------------------------------------------------------------------------
 # EVENTS mode — one flat event per telemetry event across all types
+# Phase 1: all 14 curl calls run in parallel
+# Phase 2: process responses sequentially with Python
 # ---------------------------------------------------------------------------
 run_events() {
   local tok="$1" since_ts="$2"
 
-  # Map: event_type_enum → (readMask_field, payload_key)
   declare -A EVENT_TYPES=(
     [NETWORK_STATE_CHANGE]="networkStateChangeEvent"
     [NETWORK_HTTPS_LATENCY_CHANGE]="httpsLatencyChangeEvent"
@@ -437,14 +444,14 @@ run_events() {
     [APP_LAUNCHED]="appLaunchEvent"
     [VPN_CONNECTION_STATE_CHANGE]="vpnConnectionStateChangeEvent"
     [AUDIO_SEVERE_UNDERRUN]="audioSevereUnderrunEvent"
-    [EXTERNAL_DISPLAY_CONNECTED]="externalDisplayEvent"
-    [EXTERNAL_DISPLAY_DISCONNECTED]="externalDisplayEvent"
   )
 
-  local combined
+  local combined tmp_dir
   combined=$(mktemp)
+  tmp_dir=$(mktemp -d)
   echo "[]" > "$combined"
 
+  # Phase 1: launch all API calls in parallel
   for event_type in "${!EVENT_TYPES[@]}"; do
     local payload_key="${EVENT_TYPES[$event_type]}"
     local filter="event_type=${event_type} AND timestamp>=\"${since_ts}\""
@@ -452,32 +459,48 @@ run_events() {
     url+="?readMask=$(urlencode "device,user,${payload_key}")"
     url+="&filter=$(urlencode "$filter")"
     url+="&pageSize=1000"
+    (
+      code=$(curl -sk -o "${tmp_dir}/${event_type}.json" -w "%{http_code}" \
+        -H "Authorization: Bearer ${tok}" \
+        -H "Accept: application/json" \
+        "$url" 2>/dev/null) || code="000"
+      echo "$code" > "${tmp_dir}/${event_type}.code"
+    ) &
+  done
+  wait || true  # wait for all parallel curl jobs; ignore individual failures
 
-    local resp_file
-    resp_file=$(api_get "$url" "$tok") || continue
+  # Phase 2: process responses sequentially
+  for event_type in "${!EVENT_TYPES[@]}"; do
+    local payload_key="${EVENT_TYPES[$event_type]}"
+    local body_file="${tmp_dir}/${event_type}.json"
+    local code_file="${tmp_dir}/${event_type}.code"
 
-    python3 - "$resp_file" "$combined" "$event_type" "$payload_key" <<'PYEOF'
+    [[ -f "$code_file" ]] || continue
+    local http_code
+    http_code=$(cat "$code_file")
+    http_code="${http_code:-000}"
+
+    if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+      echo "[$(date -u +%FT%TZ)] HTTP ${http_code} eventType=${event_type}: $(cat "$body_file" 2>/dev/null)" >> "$FLEX_LOG" 2>/dev/null || true
+      continue
+    fi
+
+    [[ -f "$body_file" ]] || continue
+
+    python3 - "$body_file" "$combined" "$event_type" "$payload_key" <<'PYEOF'
 import json, sys, re
 
 resp_file, combined_file, event_type, payload_key = sys.argv[1:5]
 
 def sanitize_key(k):
-    """Sanitize a JSON field name into a valid New Relic attribute name.
-
-    Applies human-readable renames for known patterns before falling back
-    to replacing all non-alphanumeric characters with underscores.
-    """
     s = str(k)
-    # HTTP response-line keys (e.g. 'HTTP/1.1', 'HTTP/2') → httpStatusCode
     if re.match(r'^HTTP/', s, re.IGNORECASE):
         return 'httpStatusCode'
-    # Replace any non-alphanumeric character with underscore, then deduplicate
     clean = re.sub(r'[^a-zA-Z0-9]', '_', s)
     clean = re.sub(r'_+', '_', clean).strip('_')
     return clean or 'unknown'
 
 def flatten(d, prefix=''):
-    """Recursively flatten a nested dict into a single-level dict with sanitized keys."""
     result = {}
     for k, v in d.items():
         full_k = f'{prefix}_{sanitize_key(k)}' if prefix else sanitize_key(k)
@@ -508,20 +531,16 @@ with open(combined_file) as f:
 for item in resp.get('events', []):
     ev = {'telemetryCategory': event_type}
 
-    # Device envelope
     dev = item.get('device', {})
     ev['deviceId']     = dev.get('deviceId', '')
     ev['serialNumber'] = dev.get('serialNumber', dev.get('deviceId', ''))
     ev['orgUnitId']    = dev.get('orgUnitId', '')
 
-    # User envelope
     user = item.get('user', {})
     ev['userEmail'] = user.get('email', '') if user else ''
 
-    # Report time
     ev['reportTime'] = item.get('reportTime', '')
 
-    # Recursively flatten the event-specific payload with sanitized keys
     payload = item.get(payload_key, {})
     if isinstance(payload, dict):
         ev.update(flatten(payload))
@@ -537,11 +556,11 @@ for item in resp.get('events', []):
 with open(combined_file, 'w') as f:
     json.dump(accumulated, f)
 PYEOF
-    rm -f "$resp_file"
   done
 
   python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))" "$combined"
   rm -f "$combined"
+  rm -rf "$tmp_dir"
 }
 
 # ---------------------------------------------------------------------------
