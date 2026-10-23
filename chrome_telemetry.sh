@@ -164,14 +164,17 @@ get_token() {
   log "Obtaining scoped access token from $key"
   python3 - <<EOF
 from google.oauth2 import service_account
-import google.auth.transport.requests, sys
+import google.auth.transport.requests, requests as _requests, sys, urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     creds = service_account.Credentials.from_service_account_file(
         '$key',
         scopes=['https://www.googleapis.com/auth/chrome.management.telemetry.readonly']
     )
-    creds.refresh(google.auth.transport.requests.Request())
+    session = _requests.Session()
+    session.verify = False
+    creds.refresh(google.auth.transport.requests.Request(session=session))
     print(creds.token)
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
